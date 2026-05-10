@@ -35,6 +35,18 @@ Run both benchmark sets with the same repetition count for every instance:
 powershell -ExecutionPolicy Bypass -File .\run_benchmarks.ps1 -Runs 50
 ```
 
+Use all logical CPU cores on a stronger machine:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_benchmarks.ps1 -Runs 50 -CpWorkers 0
+```
+
+Use multiple processes so repeated runs keep the CPU busy:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_benchmarks.ps1 -Runs 50 -CpWorkers 4 -ParallelRuns 4
+```
+
 Safer command for a lab PC that is unstable with many CP threads:
 
 ```powershell
@@ -56,3 +68,8 @@ Notes:
 - Printed and saved benchmark data includes BKS, CP average makespan, hybrid best makespan, hybrid average makespan, RPD, average time, average iterations, reached-BKS count, average time to BKS, and tabu improvement metrics.
 - The tabu phase no longer stops when BKS is reached; it keeps searching for better solutions.
 - If a machine is unstable during repeated CP runs, lower the worker count with `--cp-workers 4` or `-CpWorkers 4`.
+- `LB == UB` or an explicit metadata `optimum` is treated as proven-optimal, so that run stops early and the benchmark moves to the next run or instance.
+- A non-proven BKS or upper bound is only used as a reference; the search continues trying to beat it.
+- `-CpWorkers 0` or `--cp-workers 0` means use all logical CPU cores.
+- `-ParallelRuns N` or `--parallel-runs N` runs multiple independent repetitions at once using separate Python processes.
+- On a strong CPU, a balanced setup is usually better than using all cores inside every single run. Example: on a 16-thread machine, try `-CpWorkers 4 -ParallelRuns 4`.

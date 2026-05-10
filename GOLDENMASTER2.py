@@ -18,6 +18,7 @@ import json
 import argparse
 import csv
 import random
+import concurrent.futures
 from typing import List, Tuple, Dict, Any, Optional
 
 try:
@@ -34,6 +35,9 @@ except ImportError:
 FJSSPInstance   = List[List[List[Tuple[int, float]]]]
 MachineAssignment = List[List[int]]
 DEFAULT_CP_WORKERS = min(os.cpu_count() or 8, 8)
+
+def normalize_cp_workers(cp_workers: int) -> int:
+    return (os.cpu_count() or 8) if cp_workers <= 0 else cp_workers
 
 class Job:
     def __init__(self, job_id: str, flexible_operations: List[List[Tuple[int, float]]]):
@@ -130,6 +134,42 @@ def load_bks_from_metadata_json(path: str) -> Dict[str, float]:
 def load_bks_from_mkdata(path: str) -> Dict[str, float]:
     return load_bks_from_metadata_json(path)
 
+def load_instance_targets_from_metadata_json(path: str) -> Dict[str, Dict[str, Any]]:
+    targets: Dict[str, Dict[str, Any]] = {}
+    if not os.path.isfile(path):
+        return targets
+
+    with open(path, "r", encoding="utf-8") as f:
+        for entry in json.load(f):
+            name = entry.get("name", "").lower()
+            if not name:
+                continue
+
+            bounds = entry.get("bounds") or {}
+            optimum = entry.get("optimum")
+            lower = bounds.get("lower")
+            upper = bounds.get("upper")
+
+            lower_val = float(lower) if lower is not None else None
+            upper_val = float(upper) if upper is not None else None
+            optimum_val = float(optimum) if optimum is not None else None
+
+            proven_optimal = optimum_val is not None or (
+                lower_val is not None and upper_val is not None and abs(lower_val - upper_val) < 1e-9
+            )
+            reference = optimum_val if optimum_val is not None else upper_val
+            optimal_target = optimum_val if optimum_val is not None else (upper_val if proven_optimal else None)
+
+            targets[name] = {
+                "reference": reference,
+                "optimal_target": optimal_target,
+                "lower_bound": lower_val,
+                "upper_bound": upper_val,
+                "proven_optimal": proven_optimal,
+            }
+
+    return targets
+
 def load_bks_from_csv(csv_path: str) -> Dict[str, float]:
     """Load BKS values from a CSV file with columns: instance_name, bks (or similar)."""
     bks_map = {}
@@ -146,6 +186,18 @@ def load_bks_from_csv(csv_path: str) -> Dict[str, float]:
                     except ValueError:
                         pass
     return bks_map
+
+def load_instance_targets_from_csv(csv_path: str) -> Dict[str, Dict[str, Any]]:
+    return {
+        name: {
+            "reference": value,
+            "optimal_target": None,
+            "lower_bound": None,
+            "upper_bound": value,
+            "proven_optimal": False,
+        }
+        for name, value in load_bks_from_csv(csv_path).items()
+    }
 
 def write_benchmark_summary_csv(output_csv: str, rows: List[Dict[str, Any]]):
     fieldnames = ["Instance_Name", "BKS", "CP_Avg_Makespan", "Hybrid_Best_Makespan", "Hybrid_Avg_Makespan", 
@@ -187,11 +239,18 @@ def collect_benchmark_files(benchmark_dir: str, benchmark_set: str) -> List[str]
     raise ValueError(f"Unsupported benchmark set: {benchmark_set}")
 
 def load_bks_map(benchmark_dir: str, bks_csv: str = "", metadata_json: str = "") -> Dict[str, float]:
+    return {
+        name: info["reference"]
+        for name, info in load_instance_targets(benchmark_dir, bks_csv=bks_csv, metadata_json=metadata_json).items()
+        if info.get("reference") is not None
+    }
+
+def load_instance_targets(benchmark_dir: str, bks_csv: str = "", metadata_json: str = "") -> Dict[str, Dict[str, Any]]:
     if bks_csv and os.path.isfile(bks_csv):
-        return load_bks_from_csv(bks_csv)
+        return load_instance_targets_from_csv(bks_csv)
 
     if metadata_json and os.path.isfile(metadata_json):
-        return load_bks_from_metadata_json(metadata_json)
+        return load_instance_targets_from_metadata_json(metadata_json)
 
     candidate_paths = [
         os.path.join(benchmark_dir, "mkdata.json"),
@@ -201,7 +260,7 @@ def load_bks_map(benchmark_dir: str, bks_csv: str = "", metadata_json: str = "")
     ]
     for candidate_path in candidate_paths:
         if os.path.isfile(candidate_path):
-            return load_bks_from_metadata_json(candidate_path)
+            return load_instance_targets_from_metadata_json(candidate_path)
 
     return {}
 
@@ -234,6 +293,68 @@ def build_summary_row(inst_name: str, bks_val: Optional[float], run_records: Lis
         "First_Improvement_Time_Avg": f"{(sum(x.get('first_improvement_time', 0.0) for x in run_records) / runs):.2f}",
     }
 
+def run_single_experiment_task(task: Tuple[FJSSPInstance, float, float, Optional[float], Optional[float], int, int]) -> Dict[str, Any]:
+    instance, cp_budget, tabu_budget, bks, optimal_target, run_index, cp_workers = task
+    return run_single_experiment(
+        instance,
+        cp_budget,
+        tabu_budget,
+        bks=bks,
+        optimal_target=optimal_target,
+        run_index=run_index,
+        cp_workers=cp_workers,
+    )
+
+def run_instance_benchmark(
+    instance: FJSSPInstance,
+    cp_budget: float,
+    tabu_budget: float,
+    bks: Optional[float],
+    optimal_target: Optional[float],
+    runs: int,
+    cp_workers: int,
+    parallel_runs: int,
+    inst_name: str,
+) -> List[Dict[str, Any]]:
+    actual_parallel_runs = max(1, parallel_runs)
+    if actual_parallel_runs == 1 or runs == 1:
+        run_records: List[Dict[str, Any]] = []
+        for r in range(1, runs + 1):
+            try:
+                rec = run_single_experiment(
+                    instance,
+                    cp_budget,
+                    tabu_budget,
+                    bks=bks,
+                    optimal_target=optimal_target,
+                    run_index=r - 1,
+                    cp_workers=cp_workers,
+                )
+                run_records.append(rec)
+            except Exception as run_error:
+                print(f"  [RUN-ERROR] {inst_name} | Run {r}/{runs} failed: {run_error}")
+        return run_records
+
+    print(f"  [Parallel] {inst_name}: running up to {actual_parallel_runs} runs at once")
+    tasks = [
+        (instance, cp_budget, tabu_budget, bks, optimal_target, r - 1, cp_workers)
+        for r in range(1, runs + 1)
+    ]
+    run_records = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=actual_parallel_runs) as executor:
+        future_to_run = {
+            executor.submit(run_single_experiment_task, task): (idx + 1)
+            for idx, task in enumerate(tasks)
+        }
+        for future in concurrent.futures.as_completed(future_to_run):
+            run_number = future_to_run[future]
+            try:
+                run_records.append(future.result())
+                print(f"  [RUN-COMPLETE] {inst_name} | Run {run_number}/{runs} finished")
+            except Exception as run_error:
+                print(f"  [RUN-ERROR] {inst_name} | Run {run_number}/{runs} failed: {run_error}")
+    return run_records
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CP Solver (Native Seed Injection)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,6 +386,7 @@ def cp_initial_solution(
     run_seed: int = 0,
     cp_workers: int = DEFAULT_CP_WORKERS,
 ):
+    actual_workers = normalize_cp_workers(cp_workers)
     model = _cp_model.CpModel()
     horizon = sum(max(int(round(t * scale_factor)) for _, t in op) for job in instance for op in job)
     all_tasks, mach_intervals = {}, collections.defaultdict(list)
@@ -299,7 +421,7 @@ def cp_initial_solution(
 
     solver = _cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
-    solver.parameters.num_search_workers = max(1, cp_workers)
+    solver.parameters.num_search_workers = actual_workers
     solver.parameters.search_branching = _cp_model.PORTFOLIO_SEARCH
     solver.parameters.linearization_level = 2
     solver.parameters.random_seed = run_seed
@@ -307,7 +429,7 @@ def cp_initial_solution(
     cb = _CPProgressCallback(time_limit, stagnation_window)
     print(
         f"  [CP] Initializing with Native Seed (Seed: {run_seed} | "
-        f"Time Limit: {time_limit:.1f}s | Workers: {max(1, cp_workers)}) ..."
+        f"Time Limit: {time_limit:.1f}s | Workers: {actual_workers}) ..."
     )
     status = solver.solve(model, cb)
 
@@ -483,7 +605,14 @@ def ruin_and_recreate_fast(mach_seq: List[List[Tuple[int, int]]], instance: FJSS
 # ─────────────────────────────────────────────────────────────────────────────
 # Hyper-Optimized Tabu Core
 # ─────────────────────────────────────────────────────────────────────────────
-def run_sota_tabu_search(instance: FJSSPInstance, initial_mach_seq: List[List[Tuple[int,int]]], initial_assign: MachineAssignment, time_limit: float = 20.0, target_bks: float = -1.0):
+def run_sota_tabu_search(
+    instance: FJSSPInstance,
+    initial_mach_seq: List[List[Tuple[int,int]]],
+    initial_assign: MachineAssignment,
+    time_limit: float = 20.0,
+    target_bks: float = -1.0,
+    optimal_target: float = -1.0,
+):
     num_machines = max((m for job in instance for op in job for m, _ in op), default=0) + 1
     evaluator = DAGEvaluator(instance, num_machines)
     
@@ -519,6 +648,12 @@ def run_sota_tabu_search(instance: FJSSPInstance, initial_mach_seq: List[List[Tu
                 time_to_bks = elapsed
                 bks_logged = True
                 print(f"  [BKS-HIT] Reached BKS ({target_bks}) at {elapsed:.2f}s, continuing search for better solutions")
+        if optimal_target > 0 and global_best_ms <= optimal_target:
+            if not bks_logged:
+                time_to_bks = elapsed
+                bks_logged = True
+            print(f"  [OPTIMAL-HIT] Reached proven optimum ({optimal_target}) at {elapsed:.2f}s, moving to next run")
+            break
         if elapsed >= time_limit: break
 
         # Dynamic Tenures
@@ -660,6 +795,7 @@ def run_single_experiment(
     cp_budget: float,
     tabu_budget: float,
     bks: Optional[float] = None,
+    optimal_target: Optional[float] = None,
     run_index: int = 0,
     cp_workers: int = DEFAULT_CP_WORKERS,
 ) -> Dict[str, Any]:
@@ -684,6 +820,7 @@ def run_single_experiment(
         assign,
         time_limit=tabu_budget,
         target_bks=bks if bks else -1.0,
+        optimal_target=optimal_target if optimal_target else -1.0,
     )
     total_time = time.time() - t0
     reached_bks = (bks is not None and final_ms <= bks)
@@ -716,7 +853,8 @@ def main():
     parser.add_argument("--benchmark-set", choices=["auto", "brandimarte", "taillard"], default="auto", help="Benchmark file selection preset")
     parser.add_argument("--format", choices=["auto", "brandimarte", "jsp"], default="auto", help="Single-file parser format")
     parser.add_argument("--runs", type=int, default=10)
-    parser.add_argument("--cp-workers", type=int, default=DEFAULT_CP_WORKERS, help="CP-SAT worker threads per run (default: safer capped value)")
+    parser.add_argument("--cp-workers", type=int, default=DEFAULT_CP_WORKERS, help="CP-SAT worker threads per run; use 0 for all logical CPU cores")
+    parser.add_argument("--parallel-runs", type=int, default=1, help="Number of independent runs to execute in parallel per instance")
     parser.add_argument("--output-csv", default="benchmark_summary.csv")
     parser.add_argument("--bks-csv", default="", help="CSV file with BKS values (columns: instance_name, bks)")
     parser.add_argument("--metadata-json", default="", help="Metadata JSON such as mkdata.json or JSPLIB instances.json")
@@ -727,11 +865,14 @@ def main():
         if not os.path.isdir(benchmark_dir):
             parser.error(f"benchmark directory not found: {benchmark_dir}")
 
-        bks_map = load_bks_map(benchmark_dir, bks_csv=args.bks_csv, metadata_json=args.metadata_json)
+        target_map = load_instance_targets(benchmark_dir, bks_csv=args.bks_csv, metadata_json=args.metadata_json)
         benchmark_files = collect_benchmark_files(benchmark_dir, args.benchmark_set)
         summary_rows = []
 
-        print(f"\n  [Benchmark] Set: {args.benchmark_set} | Instances: {len(benchmark_files)} | Runs per instance: {runs}")
+        print(
+            f"\n  [Benchmark] Set: {args.benchmark_set} | Instances: {len(benchmark_files)}"
+            f" | Runs per instance: {runs} | Parallel Runs: {max(1, args.parallel_runs)}"
+        )
 
         for fname in benchmark_files:
             inst_name = os.path.splitext(fname)[0]
@@ -741,23 +882,22 @@ def main():
                 instance, _ = _jobs_to_instance(jobs)
                 cp_budget, tabu_budget = compute_time_budgets(instance)
                 
-                bks_val = bks_map.get(inst_name.lower())
-                run_records = []
+                target_info = target_map.get(inst_name.lower(), {})
+                bks_val = target_info.get("reference")
+                optimal_target = target_info.get("optimal_target")
                 
                 print(f"\n  [Benchmark] Instance {inst_name} ({detected_format}) -> running {runs} times")
-                for r in range(1, runs + 1):
-                    try:
-                        rec = run_single_experiment(
-                            instance,
-                            cp_budget,
-                            tabu_budget,
-                            bks=bks_val,
-                            run_index=r-1,
-                            cp_workers=args.cp_workers,
-                        )
-                        run_records.append(rec)
-                    except Exception as run_error:
-                        print(f"  [RUN-ERROR] {inst_name} | Run {r}/{runs} failed: {run_error}")
+                run_records = run_instance_benchmark(
+                    instance,
+                    cp_budget,
+                    tabu_budget,
+                    bks=bks_val,
+                    optimal_target=optimal_target,
+                    runs=runs,
+                    cp_workers=args.cp_workers,
+                    parallel_runs=args.parallel_runs,
+                    inst_name=inst_name,
+                )
 
                 successful_runs = len(run_records)
                 if successful_runs == 0:
@@ -785,12 +925,22 @@ def main():
         instance, _ = _jobs_to_instance(jobs)
         cp_budget, tabu_budget = compute_time_budgets(instance)
         inst_name = os.path.splitext(os.path.basename(args.instance))[0]
-        bks_map = load_bks_map(os.path.dirname(args.instance) or ".", bks_csv=args.bks_csv, metadata_json=args.metadata_json)
-        bks_val = bks_map.get(inst_name.lower())
+        target_map = load_instance_targets(os.path.dirname(args.instance) or ".", bks_csv=args.bks_csv, metadata_json=args.metadata_json)
+        target_info = target_map.get(inst_name.lower(), {})
+        bks_val = target_info.get("reference")
+        optimal_target = target_info.get("optimal_target")
 
         print(f"\n  [Single Instance] {inst_name} ({detected_format})")
         print(f"  [Budgets] CP={cp_budget:.1f}s | TS={tabu_budget:.1f}s | CP Workers={args.cp_workers}")
-        run_record = run_single_experiment(instance, cp_budget, tabu_budget, bks=bks_val, run_index=0, cp_workers=args.cp_workers)
+        run_record = run_single_experiment(
+            instance,
+            cp_budget,
+            tabu_budget,
+            bks=bks_val,
+            optimal_target=optimal_target,
+            run_index=0,
+            cp_workers=args.cp_workers,
+        )
         summary_row = build_summary_row(inst_name, bks_val, [run_record], 1)
         write_benchmark_summary_csv(args.output_csv, [summary_row])
         print(f"  [CSV] Wrote summary to: {args.output_csv}")

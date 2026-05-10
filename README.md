@@ -35,6 +35,12 @@ Run both benchmark sets with the same repetition count for every instance:
 powershell -ExecutionPolicy Bypass -File .\run_benchmarks.ps1 -Runs 50
 ```
 
+Safer command for a lab PC that is unstable with many CP threads:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_benchmarks.ps1 -Runs 50 -CpWorkers 4
+```
+
 Single instance examples:
 
 ```powershell
@@ -48,3 +54,5 @@ Notes:
 - The built-in solver setting uses the current recommended time split: 60% CP and 40% tabu within the dynamic time budget.
 - The CSV output contains one row per instance with averages across all runs.
 - Printed and saved benchmark data includes BKS, CP average makespan, hybrid best makespan, hybrid average makespan, RPD, average time, average iterations, reached-BKS count, average time to BKS, and tabu improvement metrics.
+- The tabu phase no longer stops when BKS is reached; it keeps searching for better solutions.
+- If a machine is unstable during repeated CP runs, lower the worker count with `--cp-workers 4` or `-CpWorkers 4`.

@@ -33,6 +33,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 FJSSPInstance   = List[List[List[Tuple[int, float]]]]
 MachineAssignment = List[List[int]]
+DEFAULT_CP_WORKERS = min(os.cpu_count() or 8, 8)
 
 class Job:
     def __init__(self, job_id: str, flexible_operations: List[List[Tuple[int, float]]]):
@@ -256,7 +257,14 @@ class _CPProgressCallback(_cp_model.CpSolverSolutionCallback):
         if (now - self._start_time) >= self._time_limit or (now - self._last_improve_time) > self._stagnation_window:
             self.stop_search()
 
-def cp_initial_solution(instance: FJSSPInstance, time_limit: float = 10.0, stagnation_window: float = 2.0, scale_factor: int = 100, run_seed: int = 0):
+def cp_initial_solution(
+    instance: FJSSPInstance,
+    time_limit: float = 10.0,
+    stagnation_window: float = 2.0,
+    scale_factor: int = 100,
+    run_seed: int = 0,
+    cp_workers: int = DEFAULT_CP_WORKERS,
+):
     model = _cp_model.CpModel()
     horizon = sum(max(int(round(t * scale_factor)) for _, t in op) for job in instance for op in job)
     all_tasks, mach_intervals = {}, collections.defaultdict(list)
@@ -291,17 +299,21 @@ def cp_initial_solution(instance: FJSSPInstance, time_limit: float = 10.0, stagn
 
     solver = _cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
-    solver.parameters.num_search_workers = os.cpu_count() or 8
+    solver.parameters.num_search_workers = max(1, cp_workers)
     solver.parameters.search_branching = _cp_model.PORTFOLIO_SEARCH
     solver.parameters.linearization_level = 2
     solver.parameters.random_seed = run_seed
 
     cb = _CPProgressCallback(time_limit, stagnation_window)
-    print(f"  [CP] Initializing with Native Seed (Seed: {run_seed} | Time Limit: {time_limit:.1f}s) ...")
+    print(
+        f"  [CP] Initializing with Native Seed (Seed: {run_seed} | "
+        f"Time Limit: {time_limit:.1f}s | Workers: {max(1, cp_workers)}) ..."
+    )
     status = solver.solve(model, cb)
 
     if status not in (_cp_model.OPTIMAL, _cp_model.FEASIBLE):
-        sys.exit(1)
+        status_name = solver.status_name(status)
+        raise RuntimeError(f"CP-SAT failed to find a feasible solution (status={status_name}, seed={run_seed})")
 
     assign = [[0] * len(job) for job in instance]
     
@@ -495,6 +507,7 @@ def run_sota_tabu_search(instance: FJSSPInstance, initial_mach_seq: List[List[Tu
     start_time = time.time()
     last_drop_time = 0.0
     time_to_bks = 0.0
+    bks_logged = False
     no_improve = 0
     last_best_ms = best_ms
     improvements_list = []
@@ -502,9 +515,10 @@ def run_sota_tabu_search(instance: FJSSPInstance, initial_mach_seq: List[List[Tu
     while True:
         elapsed = time.time() - start_time
         if target_bks > 0 and global_best_ms <= target_bks:
-            if time_to_bks == 0: time_to_bks = elapsed
-            print(f"  *** REACHED BKS ({target_bks}) at {elapsed:.2f}s ***")
-            break
+            if not bks_logged:
+                time_to_bks = elapsed
+                bks_logged = True
+                print(f"  [BKS-HIT] Reached BKS ({target_bks}) at {elapsed:.2f}s, continuing search for better solutions")
         if elapsed >= time_limit: break
 
         # Dynamic Tenures
@@ -641,7 +655,14 @@ def run_sota_tabu_search(instance: FJSSPInstance, initial_mach_seq: List[List[Tu
         
     return global_best_seq, global_best_ms, it, last_drop_time, time_to_bks, history
 
-def run_single_experiment(instance: FJSSPInstance, cp_budget: float, tabu_budget: float, bks: Optional[float] = None, run_index: int = 0) -> Dict[str, Any]:
+def run_single_experiment(
+    instance: FJSSPInstance,
+    cp_budget: float,
+    tabu_budget: float,
+    bks: Optional[float] = None,
+    run_index: int = 0,
+    cp_workers: int = DEFAULT_CP_WORKERS,
+) -> Dict[str, Any]:
     t0 = time.time()
     
     print(f"\n  [RUN {run_index + 1}] Starting experiment...")
@@ -649,7 +670,8 @@ def run_single_experiment(instance: FJSSPInstance, cp_budget: float, tabu_budget
         instance,
         time_limit=cp_budget,
         stagnation_window=15.0,
-        run_seed=run_index * 13 
+        run_seed=run_index * 13,
+        cp_workers=cp_workers,
     )
     
     cp_time = time.time() - t0
@@ -694,6 +716,7 @@ def main():
     parser.add_argument("--benchmark-set", choices=["auto", "brandimarte", "taillard"], default="auto", help="Benchmark file selection preset")
     parser.add_argument("--format", choices=["auto", "brandimarte", "jsp"], default="auto", help="Single-file parser format")
     parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument("--cp-workers", type=int, default=DEFAULT_CP_WORKERS, help="CP-SAT worker threads per run (default: safer capped value)")
     parser.add_argument("--output-csv", default="benchmark_summary.csv")
     parser.add_argument("--bks-csv", default="", help="CSV file with BKS values (columns: instance_name, bks)")
     parser.add_argument("--metadata-json", default="", help="Metadata JSON such as mkdata.json or JSPLIB instances.json")
@@ -723,14 +746,30 @@ def main():
                 
                 print(f"\n  [Benchmark] Instance {inst_name} ({detected_format}) -> running {runs} times")
                 for r in range(1, runs + 1):
-                    rec = run_single_experiment(instance, cp_budget, tabu_budget, bks=bks_val, run_index=r-1)
-                    run_records.append(rec)
+                    try:
+                        rec = run_single_experiment(
+                            instance,
+                            cp_budget,
+                            tabu_budget,
+                            bks=bks_val,
+                            run_index=r-1,
+                            cp_workers=args.cp_workers,
+                        )
+                        run_records.append(rec)
+                    except Exception as run_error:
+                        print(f"  [RUN-ERROR] {inst_name} | Run {r}/{runs} failed: {run_error}")
 
-                summary_row = build_summary_row(inst_name, bks_val, run_records, runs)
+                successful_runs = len(run_records)
+                if successful_runs == 0:
+                    print(f"  [ERROR] Instance {inst_name} produced no successful runs")
+                    continue
+
+                summary_row = build_summary_row(inst_name, bks_val, run_records, successful_runs)
                 summary_rows.append(summary_row)
                 print(
                     f"  [Result] {inst_name} summary | Best={summary_row['Hybrid_Best_Makespan']}"
                     f" | Avg={summary_row['Hybrid_Avg_Makespan']} | RPD={summary_row['RPD_%'] or 'n/a'}%"
+                    f" | Successful Runs={successful_runs}/{runs}"
                 )
                 
                 write_benchmark_summary_csv(args.output_csv, summary_rows)
@@ -750,8 +789,8 @@ def main():
         bks_val = bks_map.get(inst_name.lower())
 
         print(f"\n  [Single Instance] {inst_name} ({detected_format})")
-        print(f"  [Budgets] CP={cp_budget:.1f}s | TS={tabu_budget:.1f}s")
-        run_record = run_single_experiment(instance, cp_budget, tabu_budget, bks=bks_val, run_index=0)
+        print(f"  [Budgets] CP={cp_budget:.1f}s | TS={tabu_budget:.1f}s | CP Workers={args.cp_workers}")
+        run_record = run_single_experiment(instance, cp_budget, tabu_budget, bks=bks_val, run_index=0, cp_workers=args.cp_workers)
         summary_row = build_summary_row(inst_name, bks_val, [run_record], 1)
         write_benchmark_summary_csv(args.output_csv, [summary_row])
         print(f"  [CSV] Wrote summary to: {args.output_csv}")

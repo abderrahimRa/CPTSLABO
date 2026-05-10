@@ -1,0 +1,2 @@
+Instance_Name,BKS,CP_Avg_Makespan,Hybrid_Best_Makespan,Hybrid_Avg_Makespan,RPD_%,Avg_Time_Sec,Avg_Iterations,Reached_BKS_Count,Avg_Time_To_BKS_Sec,TS_Improvement_Avg,TS_Improvement_Pct_Avg,First_Improvement_Time_Avg
+ta01,1231.00,1231.00,1231.00,1231.00,0.00,29.74,0,1/1,,0.00,0.00%,0.00

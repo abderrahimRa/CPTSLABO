@@ -16,10 +16,23 @@ python .\GOLDENMASTER2.py --benchmark-dir ".\brandimarte_instances" --benchmark-
 python .\GOLDENMASTER2.py --benchmark-dir ".\taillard_instances" --benchmark-set taillard --runs 1 --output-csv ".\results\taillard_results.csv"
 ```
 
+Run all instances with many repetitions:
+
+```powershell
+python .\GOLDENMASTER2.py --benchmark-dir ".\brandimarte_instances" --benchmark-set brandimarte --runs 50 --output-csv ".\results\brandimarte_results.csv"
+python .\GOLDENMASTER2.py --benchmark-dir ".\taillard_instances" --benchmark-set taillard --runs 50 --output-csv ".\results\taillard_results.csv"
+```
+
 Run both benchmark sets:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_benchmarks.ps1 -BrandimarteRuns 1 -TaillardRuns 1
+```
+
+Run both benchmark sets with the same repetition count for every instance:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_benchmarks.ps1 -Runs 50
 ```
 
 Single instance examples:
@@ -33,3 +46,5 @@ Notes:
 - The solver auto-loads `mkdata.json` for Brandimarte BKS values.
 - The solver auto-loads `instances.json` for Taillard BKS and bounds.
 - The built-in solver setting uses the current recommended time split: 60% CP and 40% tabu within the dynamic time budget.
+- The CSV output contains one row per instance with averages across all runs.
+- Printed and saved benchmark data includes BKS, CP average makespan, hybrid best makespan, hybrid average makespan, RPD, average time, average iterations, reached-BKS count, average time to BKS, and tabu improvement metrics.

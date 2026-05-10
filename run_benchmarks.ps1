@@ -1,9 +1,15 @@
 param(
+    [int]$Runs = 0,
     [int]$BrandimarteRuns = 1,
     [int]$TaillardRuns = 1
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Runs -gt 0) {
+    $BrandimarteRuns = $Runs
+    $TaillardRuns = $Runs
+}
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $solver = Join-Path $root "GOLDENMASTER2.py"

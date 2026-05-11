@@ -191,18 +191,34 @@ def load_instance_targets_from_csv(csv_path: str) -> Dict[str, Dict[str, Any]]:
     return {
         name: {
             "reference": value,
-            "optimal_target": None,
+            "optimal_target": value,
             "lower_bound": None,
             "upper_bound": value,
-            "proven_optimal": False,
+            "proven_optimal": True,
         }
         for name, value in load_bks_from_csv(csv_path).items()
     }
 
 def write_benchmark_summary_csv(output_csv: str, rows: List[Dict[str, Any]]):
-    fieldnames = ["Instance_Name", "BKS", "CP_Avg_Makespan", "Hybrid_Best_Makespan", "Hybrid_Avg_Makespan", 
-                  "RPD_%", "Avg_Time_Sec", "Avg_Iterations", "Reached_BKS_Count", "Avg_Time_To_BKS_Sec",
-                  "TS_Improvement_Avg", "TS_Improvement_Pct_Avg", "First_Improvement_Time_Avg"]
+    fieldnames = [
+        "Instance_Name",
+        "Lower_Bound",
+        "Upper_Bound",
+        "BKS",
+        "Proven_Optimal",
+        "CP_Avg_Makespan",
+        "CP_Only_TotalBudget_Avg_Makespan",
+        "Hybrid_Best_Makespan",
+        "Hybrid_Avg_Makespan",
+        "RPD_%",
+        "Avg_Time_Sec",
+        "Avg_Iterations",
+        "Reached_BKS_Count",
+        "Avg_Time_To_BKS_Sec",
+        "TS_Improvement_Avg",
+        "TS_Improvement_Pct_Avg",
+        "First_Improvement_Time_Avg",
+    ]
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -270,17 +286,69 @@ def compute_time_budgets(instance: FJSSPInstance) -> Tuple[float, float]:
     t_max = 0.72 * (num_jobs * num_machines)
     return t_max * 0.60, t_max * 0.40
 
-def build_summary_row(inst_name: str, bks_val: Optional[float], run_records: List[Dict[str, Any]], runs: int) -> Dict[str, str]:
+def resolve_time_budgets(
+    instance: FJSSPInstance,
+    cp_budget_override: Optional[float] = None,
+    tabu_budget_override: Optional[float] = None,
+    total_budget_override: Optional[float] = None,
+    cp_fraction: Optional[float] = None,
+) -> Tuple[float, float, float, str]:
+    default_cp_budget, default_tabu_budget = compute_time_budgets(instance)
+    default_total_budget = default_cp_budget + default_tabu_budget
+    total_budget = default_total_budget if total_budget_override is None else max(0.0, total_budget_override)
+
+    if cp_budget_override is not None and tabu_budget_override is not None:
+        cp_budget = max(0.0, cp_budget_override)
+        tabu_budget = max(0.0, tabu_budget_override)
+        total_budget = cp_budget + tabu_budget
+        budget_mode = "explicit cp+tabu"
+    elif cp_budget_override is not None:
+        cp_budget = max(0.0, cp_budget_override)
+        tabu_budget = max(0.0, total_budget - cp_budget)
+        budget_mode = "explicit cp"
+    elif tabu_budget_override is not None:
+        tabu_budget = max(0.0, tabu_budget_override)
+        cp_budget = max(0.0, total_budget - tabu_budget)
+        budget_mode = "explicit tabu"
+    else:
+        cp_share = 0.60 if cp_fraction is None else cp_fraction
+        cp_budget = total_budget * cp_share
+        tabu_budget = total_budget - cp_budget
+        budget_mode = "fractional split" if cp_fraction is not None else "dynamic default"
+
+    return cp_budget, tabu_budget, total_budget, budget_mode
+
+def _fmt_metric(value: Optional[float]) -> str:
+    return f"{value:.2f}" if value is not None else "n/a"
+
+def format_target_summary(target_info: Dict[str, Any]) -> str:
+    return (
+        f"LB={_fmt_metric(target_info.get('lower_bound'))}"
+        f" | UB={_fmt_metric(target_info.get('upper_bound'))}"
+        f" | BKS={_fmt_metric(target_info.get('optimal_target'))}"
+        f" | Proven={'yes' if target_info.get('proven_optimal') else 'no'}"
+    )
+
+def build_summary_row(inst_name: str, target_info: Dict[str, Any], run_records: List[Dict[str, Any]], runs: int) -> Dict[str, str]:
+    bks_val = target_info.get("optimal_target")
+    lower_bound = target_info.get("lower_bound")
+    upper_bound = target_info.get("upper_bound")
+    proven_optimal = bool(target_info.get("proven_optimal"))
     avg_ms = sum(x["final_ms"] for x in run_records) / runs
     rpd = ((avg_ms - bks_val) / bks_val) * 100.0 if bks_val else 0.0
     avg_ts_improvement = sum(x.get("ts_improvement", 0.0) for x in run_records) / runs
     avg_ts_improvement_pct = sum(x.get("ts_improvement_pct", 0.0) for x in run_records) / runs
     time_to_bks_values = [x["time_to_bks"] for x in run_records if x["time_to_bks"] > 0]
+    cp_only_values = [x["cp_only_ms"] for x in run_records if x.get("cp_only_ms") is not None]
 
     return {
         "Instance_Name": inst_name,
+        "Lower_Bound": f"{lower_bound:.2f}" if lower_bound is not None else "",
+        "Upper_Bound": f"{upper_bound:.2f}" if upper_bound is not None else "",
         "BKS": f"{bks_val:.2f}" if bks_val else "",
+        "Proven_Optimal": "yes" if proven_optimal else "no",
         "CP_Avg_Makespan": f"{(sum(x['cp_ms'] for x in run_records) / runs):.2f}",
+        "CP_Only_TotalBudget_Avg_Makespan": f"{(sum(cp_only_values) / len(cp_only_values)):.2f}" if cp_only_values else "",
         "Hybrid_Best_Makespan": f"{min(x['final_ms'] for x in run_records):.2f}",
         "Hybrid_Avg_Makespan": f"{avg_ms:.2f}",
         "RPD_%": f"{rpd:.2f}" if bks_val else "",
@@ -293,43 +361,24 @@ def build_summary_row(inst_name: str, bks_val: Optional[float], run_records: Lis
         "First_Improvement_Time_Avg": f"{(sum(x.get('first_improvement_time', 0.0) for x in run_records) / runs):.2f}",
     }
 
-def run_single_experiment_task(task: Tuple[FJSSPInstance, float, float, Optional[float], Optional[float], int, int]) -> Dict[str, Any]:
-    instance, cp_budget, tabu_budget, bks, optimal_target, run_index, cp_workers = task
-    return run_single_experiment(
-        instance,
-        cp_budget,
-        tabu_budget,
-        bks=bks,
-        optimal_target=optimal_target,
-        run_index=run_index,
-        cp_workers=cp_workers,
-    )
+def run_single_experiment_task(task: Tuple[FJSSPInstance, Dict[str, Any], int, Dict[str, Any]]) -> Dict[str, Any]:
+    instance, target_info, run_index, run_config = task
+    return run_single_experiment(instance, target_info=target_info, run_index=run_index, **run_config)
 
 def run_instance_benchmark(
     instance: FJSSPInstance,
-    cp_budget: float,
-    tabu_budget: float,
-    bks: Optional[float],
-    optimal_target: Optional[float],
+    target_info: Dict[str, Any],
     runs: int,
-    cp_workers: int,
     parallel_runs: int,
     inst_name: str,
+    run_config: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     actual_parallel_runs = max(1, parallel_runs)
     if actual_parallel_runs == 1 or runs == 1:
         run_records: List[Dict[str, Any]] = []
         for r in range(1, runs + 1):
             try:
-                rec = run_single_experiment(
-                    instance,
-                    cp_budget,
-                    tabu_budget,
-                    bks=bks,
-                    optimal_target=optimal_target,
-                    run_index=r - 1,
-                    cp_workers=cp_workers,
-                )
+                rec = run_single_experiment(instance, target_info=target_info, run_index=r - 1, **run_config)
                 run_records.append(rec)
             except Exception as run_error:
                 print(f"  [RUN-ERROR] {inst_name} | Run {r}/{runs} failed: {run_error}")
@@ -337,7 +386,7 @@ def run_instance_benchmark(
 
     print(f"  [Parallel] {inst_name}: running up to {actual_parallel_runs} runs at once")
     tasks = [
-        (instance, cp_budget, tabu_budget, bks, optimal_target, r - 1, cp_workers)
+        (instance, target_info, r - 1, run_config)
         for r in range(1, runs + 1)
     ]
     run_records = []
@@ -462,6 +511,55 @@ def cp_initial_solution(
 
     return mach_sequences, assign, solver.objective_value / scale_factor
 
+def run_cp_multistart(
+    instance: FJSSPInstance,
+    total_budget: float,
+    cp_starts: int,
+    cp_workers: int,
+    cp_stagnation_window: float,
+    run_seed_base: int,
+    label: str,
+) -> List[Dict[str, Any]]:
+    actual_starts = max(1, cp_starts)
+    budget_per_start = max(0.01, total_budget / actual_starts)
+    candidates: List[Dict[str, Any]] = []
+
+    print(
+        f"  [{label}] Launching {actual_starts} CP starts | Budget/start={budget_per_start:.2f}s"
+        f" | Stagnation={cp_stagnation_window:.2f}s | Workers={normalize_cp_workers(cp_workers)}"
+    )
+
+    for start_idx in range(actual_starts):
+        seed = run_seed_base + start_idx * 97
+        cp_t0 = time.time()
+        mach_seq, assign, cp_ms = cp_initial_solution(
+            instance,
+            time_limit=budget_per_start,
+            stagnation_window=cp_stagnation_window,
+            run_seed=seed,
+            cp_workers=cp_workers,
+        )
+        cp_time = time.time() - cp_t0
+        candidate = {
+            "seed": seed,
+            "cp_ms": cp_ms,
+            "time_sec": cp_time,
+            "mach_seq": mach_seq,
+            "assign": assign,
+        }
+        candidates.append(candidate)
+        print(
+            f"  [{label}] Start {start_idx + 1}/{actual_starts} | Seed={seed}"
+            f" | Makespan={cp_ms:.2f} | Time={cp_time:.2f}s"
+        )
+
+    best_candidate = min(candidates, key=lambda c: (c["cp_ms"], c["time_sec"]))
+    print(
+        f"  [{label}] Best CP start | Seed={best_candidate['seed']}"
+        f" | Makespan={best_candidate['cp_ms']:.2f}"
+    )
+    return candidates
+
 # ─────────────────────────────────────────────────────────────────────────────
 # O(1) SOTA DAG Evaluator (Heads & Tails)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -580,7 +678,6 @@ class DAGEvaluator:
         est_ms = max(
             r_v_new + p_times.get(v_op, 1.0) + tails.get(v_op, 0.0),
             r_u_new + p_times.get(u_op, 1.0) + tails.get(u_op, 0.0),
-            current_makespan
         )
         return est_ms
 
@@ -610,8 +707,11 @@ def run_sota_tabu_search(
     initial_mach_seq: List[List[Tuple[int,int]]],
     initial_assign: MachineAssignment,
     time_limit: float = 20.0,
-    target_bks: float = -1.0,
-    optimal_target: float = -1.0,
+    reference_target: float = -1.0,
+    bks_target: float = -1.0,
+    stop_on_bks: bool = True,
+    route_topk: int = 1,
+    log_interval: float = 5.0,
 ):
     num_machines = max((m for job in instance for op in job for m, _ in op), default=0) + 1
     evaluator = DAGEvaluator(instance, num_machines)
@@ -637,23 +737,28 @@ def run_sota_tabu_search(
     last_drop_time = 0.0
     time_to_bks = 0.0
     bks_logged = False
+    reference_logged = False
     no_improve = 0
     last_best_ms = best_ms
     improvements_list = []
+    next_status_log = log_interval if log_interval > 0 else float("inf")
 
     while True:
         elapsed = time.time() - start_time
-        if target_bks > 0 and global_best_ms <= target_bks:
+        if bks_target > 0 and global_best_ms <= bks_target:
             if not bks_logged:
                 time_to_bks = elapsed
                 bks_logged = True
-                print(f"  [BKS-HIT] Reached BKS ({target_bks}) at {elapsed:.2f}s, continuing search for better solutions")
-        if optimal_target > 0 and global_best_ms <= optimal_target:
-            if not bks_logged:
-                time_to_bks = elapsed
-                bks_logged = True
-            print(f"  [OPTIMAL-HIT] Reached proven optimum ({optimal_target}) at {elapsed:.2f}s, moving to next run")
-            break
+                if stop_on_bks:
+                    print(f"  [BKS-HIT] Reached proven BKS ({bks_target}) at {elapsed:.2f}s, moving to next run")
+                else:
+                    print(f"  [BKS-HIT] Reached proven BKS ({bks_target}) at {elapsed:.2f}s, continuing search (--continue-after-bks)")
+            if stop_on_bks:
+                break
+        if reference_target > 0 and global_best_ms <= reference_target and not reference_logged:
+            if bks_target <= 0 or abs(reference_target - bks_target) > 1e-9:
+                print(f"  [REF-HIT] Reached reference upper bound ({reference_target}) at {elapsed:.2f}s, continuing search")
+            reference_logged = True
         if elapsed >= time_limit: break
 
         # Dynamic Tenures
@@ -680,6 +785,8 @@ def run_sota_tabu_search(
         best_neighbor_assign = None
         best_move_hash_seq = None
         best_move_hash_route = None
+        n5_candidates = 0
+        n6_exact_evals = 0
 
         # Compute p_times for O(1) swap estimate
         p_times_curr = {(j, o): instance[j][o][assign[j][o]][1] for j in range(len(instance)) for o in range(len(instance[j]))}
@@ -692,6 +799,7 @@ def run_sota_tabu_search(
                 v_op: Tuple[int, int] = seq[i+1]
                 if u_op in critical_ops or v_op in critical_ops:
                     if u_op[0] == v_op[0]: continue 
+                    n5_candidates += 1
                     
                     move_hash = frozenset([u_op, v_op])
                     is_tabu = tabu_list_seq.get(move_hash, 0) > it
@@ -724,18 +832,13 @@ def run_sota_tabu_search(
                 route_hash = (j, o, m_new)
                 is_tabu = tabu_list_route.get(route_hash, 0) > it
 
-                best_k = -1
-                best_k_est = float('inf')
-                
                 temp_seq = mach_seq[m_new]
+                route_candidates = []
                 for k in range(len(temp_seq) + 1):
-                    # Uses Heads/Tails + assign to evaluate insertion in O(1)
                     est = evaluator.get_o1_insertion_estimate(j, o, p_new, temp_seq, k, heads, tails, assign)
-                    if est < best_k_est:
-                        best_k_est = est
-                        best_k = k
-                        
-                if best_k != -1:
+                    route_candidates.append((est, k))
+
+                for _, best_k in sorted(route_candidates, key=lambda item: item[0])[:max(1, route_topk)]:
                     n_seq = [list(s) for s in mach_seq]
                     n_seq[current_m].remove((j, o))
                     n_seq[m_new].insert(best_k, (j, o))
@@ -744,6 +847,7 @@ def run_sota_tabu_search(
                     n_assign[j][o] = opt_idx
                     
                     c_ms, _, _, _, c_valid = evaluator.evaluate(n_seq, n_assign)
+                    n6_exact_evals += 1
                     
                     if c_valid:
                         penalty = 1.05 if ms_plateau_counts[c_ms] > 20 else 1.0
@@ -787,6 +891,13 @@ def run_sota_tabu_search(
             no_improve += 1
             
         it += 1
+        if elapsed >= next_status_log:
+            print(
+                f"    [TS-STATUS] t={elapsed:.2f}s | iter={it} | current={best_ms:.2f}"
+                f" | best={global_best_ms:.2f} | no_improve={no_improve} | critical={len(critical_ops)}"
+                f" | n5={n5_candidates} | n6_exact={n6_exact_evals}"
+            )
+            next_status_log += log_interval
         
     return global_best_seq, global_best_ms, it, last_drop_time, time_to_bks, history
 
@@ -794,53 +905,151 @@ def run_single_experiment(
     instance: FJSSPInstance,
     cp_budget: float,
     tabu_budget: float,
-    bks: Optional[float] = None,
-    optimal_target: Optional[float] = None,
+    target_info: Optional[Dict[str, Any]] = None,
     run_index: int = 0,
     cp_workers: int = DEFAULT_CP_WORKERS,
+    cp_stagnation_window: float = 15.0,
+    cp_starts: int = 1,
+    tabu_starts: int = 1,
+    route_topk: int = 1,
+    stop_on_bks: bool = True,
+    log_interval: float = 5.0,
+    run_cp_only_baseline: bool = False,
 ) -> Dict[str, Any]:
     t0 = time.time()
-    
+    target_info = target_info or {}
+    bks = target_info.get("optimal_target")
+    reference_target = target_info.get("reference")
+    total_budget = cp_budget + tabu_budget
+    actual_tabu_starts = max(1, min(max(1, tabu_starts), max(1, cp_starts))) if tabu_budget > 0 else 0
+
     print(f"\n  [RUN {run_index + 1}] Starting experiment...")
-    mach_seq, assign, cp_ms = cp_initial_solution(
+    print(
+        f"  [RUN-CONFIG] Targets: {format_target_summary(target_info)}"
+        f" | CP={cp_budget:.2f}s | TS={tabu_budget:.2f}s | Total={total_budget:.2f}s"
+    )
+    print(
+        f"  [RUN-CONFIG] CP starts={max(1, cp_starts)} | TS starts={actual_tabu_starts}"
+        f" | Route top-k={max(1, route_topk)} | Stop on BKS={stop_on_bks}"
+        f" | CP stagnation={cp_stagnation_window:.2f}s | CP workers={normalize_cp_workers(cp_workers)}"
+    )
+
+    cp_candidates = run_cp_multistart(
         instance,
-        time_limit=cp_budget,
-        stagnation_window=15.0,
-        run_seed=run_index * 13,
+        total_budget=cp_budget,
+        cp_starts=cp_starts,
         cp_workers=cp_workers,
+        cp_stagnation_window=cp_stagnation_window,
+        run_seed_base=run_index * 1000,
+        label="CP-HANDOFF",
     )
-    
-    cp_time = time.time() - t0
-    print(f"  [CP-DONE] Time: {cp_time:.2f}s | Initial Makespan: {cp_ms:.2f}")
-    print(f"  [CP->TS HANDOFF] CP Solution: {cp_ms:.2f} | Passing to SOTA Tabu Search ({tabu_budget:.1f}s budget)...")
-    
-    _, final_ms, total_iters, last_drop_time, time_to_bks, history = run_sota_tabu_search(
-        instance,
-        mach_seq,
-        assign,
-        time_limit=tabu_budget,
-        target_bks=bks if bks else -1.0,
-        optimal_target=optimal_target if optimal_target else -1.0,
+    cp_time = sum(candidate["time_sec"] for candidate in cp_candidates)
+    best_cp_candidate = min(cp_candidates, key=lambda candidate: (candidate["cp_ms"], candidate["time_sec"]))
+    selected_cp_candidates = sorted(cp_candidates, key=lambda candidate: (candidate["cp_ms"], candidate["time_sec"]))[:max(1, actual_tabu_starts or 1)]
+    print(
+        f"  [CP->TS HANDOFF] Selected {len(selected_cp_candidates)}/{len(cp_candidates)} CP starts"
+        f" for tabu search | Best CP={best_cp_candidate['cp_ms']:.2f}"
     )
+
+    cp_only_ms: Optional[float] = None
+    if run_cp_only_baseline:
+        cp_only_candidates = run_cp_multistart(
+            instance,
+            total_budget=total_budget,
+            cp_starts=cp_starts,
+            cp_workers=cp_workers,
+            cp_stagnation_window=cp_stagnation_window,
+            run_seed_base=run_index * 1000 + 50000,
+            label="CP-BASELINE",
+        )
+        cp_only_ms = min(candidate["cp_ms"] for candidate in cp_only_candidates)
+        print(f"  [CP-BASELINE] Best CP-only makespan with total budget: {cp_only_ms:.2f}")
+
+    ts_results: List[Dict[str, Any]] = []
+    total_ts_time = 0.0
+    if tabu_budget > 0:
+        tabu_budget_per_start = max(0.01, tabu_budget / max(1, actual_tabu_starts))
+        for start_idx, candidate in enumerate(selected_cp_candidates, start=1):
+            print(
+                f"  [TS-START] Candidate {start_idx}/{len(selected_cp_candidates)} | Seed={candidate['seed']}"
+                f" | CP makespan={candidate['cp_ms']:.2f} | TS budget={tabu_budget_per_start:.2f}s"
+            )
+            ts_t0 = time.time()
+            _, final_ms, total_iters, last_drop_time, time_to_bks, history = run_sota_tabu_search(
+                instance,
+                candidate["mach_seq"],
+                candidate["assign"],
+                time_limit=tabu_budget_per_start,
+                reference_target=reference_target if reference_target else -1.0,
+                bks_target=bks if bks else -1.0,
+                stop_on_bks=stop_on_bks,
+                route_topk=route_topk,
+                log_interval=log_interval,
+            )
+            total_ts_time += time.time() - ts_t0
+            ts_results.append(
+                {
+                    "seed": candidate["seed"],
+                    "cp_ms": candidate["cp_ms"],
+                    "final_ms": final_ms,
+                    "iters": total_iters,
+                    "last_drop_time": last_drop_time,
+                    "time_to_bks": time_to_bks,
+                    "history": history,
+                }
+            )
+
+    if ts_results:
+        best_result = min(ts_results, key=lambda result: (result["final_ms"], result["cp_ms"]))
+        cp_ms = best_result["cp_ms"]
+        final_ms = best_result["final_ms"]
+        total_iters = best_result["iters"]
+        last_drop_time = best_result["last_drop_time"]
+        time_to_bks = best_result["time_to_bks"]
+        history = best_result["history"]
+        selected_seed = best_result["seed"]
+    else:
+        cp_ms = best_cp_candidate["cp_ms"]
+        final_ms = cp_ms
+        total_iters = 0
+        last_drop_time = 0.0
+        time_to_bks = 0.0
+        history = []
+        selected_seed = best_cp_candidate["seed"]
+
     total_time = time.time() - t0
     reached_bks = (bks is not None and final_ms <= bks)
-    
+
     ts_improvement = cp_ms - final_ms
     ts_improvement_pct = (ts_improvement / cp_ms * 100.0) if cp_ms > 0 else 0
     first_improvement_time = history[0][0] if history else 0.0
-    
-    print(f"  [HYBRID_FINAL] Initial CP: {cp_ms:.2f} -> Final TS: {final_ms:.2f}")
+
+    print(
+        f"  [HYBRID_FINAL] Selected seed={selected_seed} | Initial CP: {cp_ms:.2f}"
+        f" -> Final TS: {final_ms:.2f} | Best CP among starts: {best_cp_candidate['cp_ms']:.2f}"
+    )
     print(f"  [IMPROVEMENT] TS Gain: {ts_improvement:.2f} ({ts_improvement_pct:.2f}%) | Total Time: {total_time:.2f}s | Total Iters: {total_iters}")
+    if cp_only_ms is not None:
+        hybrid_advantage = cp_only_ms - final_ms
+        hybrid_advantage_pct = (hybrid_advantage / cp_only_ms * 100.0) if cp_only_ms > 0 else 0.0
+        print(
+            f"  [CP-ONLY VS HYBRID] CP-only total budget: {cp_only_ms:.2f}"
+            f" | Hybrid delta: {hybrid_advantage:.2f} ({hybrid_advantage_pct:.2f}%)"
+        )
     if bks:
         gap = ((final_ms - bks) / bks * 100.0)
         print(f"  [GAP-TO-BKS] BKS: {bks:.2f} | Gap: {gap:.2f}% | Reached: {reached_bks}")
+    elif reference_target:
+        reference_gap = ((final_ms - reference_target) / reference_target * 100.0)
+        print(f"  [GAP-TO-UB] UB: {reference_target:.2f} | Gap: {reference_gap:.2f}% | Proven BKS: no")
 
     return {
         "cp_ms": cp_ms, "final_ms": final_ms, "time_sec": total_time,
         "iters": float(total_iters), "last_drop_time": last_drop_time,
         "time_to_bks": time_to_bks, "reached_bks": reached_bks, "history": history,
         "ts_improvement": ts_improvement, "ts_improvement_pct": ts_improvement_pct,
-        "first_improvement_time": first_improvement_time, "ts_time": total_time - cp_time
+        "first_improvement_time": first_improvement_time, "ts_time": total_ts_time,
+        "cp_only_ms": cp_only_ms,
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -855,10 +1064,49 @@ def main():
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--cp-workers", type=int, default=DEFAULT_CP_WORKERS, help="CP-SAT worker threads per run; use 0 for all logical CPU cores")
     parser.add_argument("--parallel-runs", type=int, default=1, help="Number of independent runs to execute in parallel per instance")
+    parser.add_argument("--cp-budget", type=float, default=None, help="Explicit CP budget in seconds")
+    parser.add_argument("--tabu-budget", type=float, default=None, help="Explicit tabu budget in seconds")
+    parser.add_argument("--total-budget", type=float, default=None, help="Explicit total budget in seconds before splitting")
+    parser.add_argument("--cp-fraction", type=float, default=None, help="CP share of the total budget, from 0.0 to 1.0")
+    parser.add_argument("--cp-stagnation-window", type=float, default=15.0, help="Stop a CP start after this many seconds without improvement")
+    parser.add_argument("--cp-starts", type=int, default=1, help="Number of diversified CP starts before tabu handoff")
+    parser.add_argument("--tabu-starts", type=int, default=1, help="Number of top CP starts to continue with tabu search")
+    parser.add_argument("--route-topk", type=int, default=1, help="Exact-evaluate the top K routing insertion positions per alternative")
+    parser.add_argument("--log-interval", type=float, default=5.0, help="Seconds between tabu status updates; use 0 to disable")
+    parser.add_argument("--continue-after-bks", action="store_true", help="Keep tabu running even after reaching a proven BKS")
+    parser.add_argument("--cp-only-baseline", action="store_true", help="Also run a CP-only baseline with the full hybrid time budget")
     parser.add_argument("--output-csv", default="benchmark_summary.csv")
     parser.add_argument("--bks-csv", default="", help="CSV file with BKS values (columns: instance_name, bks)")
     parser.add_argument("--metadata-json", default="", help="Metadata JSON such as mkdata.json or JSPLIB instances.json")
     args = parser.parse_args()
+
+    if args.runs < 1:
+        parser.error("--runs must be at least 1")
+    if args.parallel_runs < 1:
+        parser.error("--parallel-runs must be at least 1")
+    if args.cp_starts < 1:
+        parser.error("--cp-starts must be at least 1")
+    if args.tabu_starts < 1:
+        parser.error("--tabu-starts must be at least 1")
+    if args.route_topk < 1:
+        parser.error("--route-topk must be at least 1")
+    if args.cp_fraction is not None and not 0.0 <= args.cp_fraction <= 1.0:
+        parser.error("--cp-fraction must be between 0.0 and 1.0")
+    for name in ("cp_budget", "tabu_budget", "total_budget", "cp_stagnation_window"):
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
+
+    shared_run_config = {
+        "cp_workers": args.cp_workers,
+        "cp_stagnation_window": args.cp_stagnation_window,
+        "cp_starts": args.cp_starts,
+        "tabu_starts": args.tabu_starts,
+        "route_topk": args.route_topk,
+        "stop_on_bks": not args.continue_after_bks,
+        "log_interval": args.log_interval,
+        "run_cp_only_baseline": args.cp_only_baseline,
+    }
 
     if args.benchmark_dir:
         benchmark_dir, runs = args.benchmark_dir, max(1, args.runs)
@@ -873,6 +1121,11 @@ def main():
             f"\n  [Benchmark] Set: {args.benchmark_set} | Instances: {len(benchmark_files)}"
             f" | Runs per instance: {runs} | Parallel Runs: {max(1, args.parallel_runs)}"
         )
+        print(
+            f"  [Global Config] CP starts={args.cp_starts} | TS starts={args.tabu_starts}"
+            f" | Route top-k={args.route_topk} | Continue after BKS={args.continue_after_bks}"
+            f" | CP-only baseline={args.cp_only_baseline} | CP workers={normalize_cp_workers(args.cp_workers)}"
+        )
 
         for fname in benchmark_files:
             inst_name = os.path.splitext(fname)[0]
@@ -880,23 +1133,31 @@ def main():
                 inst_path = os.path.join(benchmark_dir, fname)
                 jobs, _, detected_format = parse_instance_file(inst_path, args.format)
                 instance, _ = _jobs_to_instance(jobs)
-                cp_budget, tabu_budget = compute_time_budgets(instance)
+                cp_budget, tabu_budget, total_budget, budget_mode = resolve_time_budgets(
+                    instance,
+                    cp_budget_override=args.cp_budget,
+                    tabu_budget_override=args.tabu_budget,
+                    total_budget_override=args.total_budget,
+                    cp_fraction=args.cp_fraction,
+                )
                 
                 target_info = target_map.get(inst_name.lower(), {})
-                bks_val = target_info.get("reference")
-                optimal_target = target_info.get("optimal_target")
+                run_config = dict(shared_run_config)
+                run_config.update({"cp_budget": cp_budget, "tabu_budget": tabu_budget})
                 
                 print(f"\n  [Benchmark] Instance {inst_name} ({detected_format}) -> running {runs} times")
+                print(f"  [Targets] {format_target_summary(target_info)}")
+                print(
+                    f"  [Budget Plan] Mode={budget_mode} | Total={total_budget:.2f}s"
+                    f" | CP={cp_budget:.2f}s | TS={tabu_budget:.2f}s"
+                )
                 run_records = run_instance_benchmark(
                     instance,
-                    cp_budget,
-                    tabu_budget,
-                    bks=bks_val,
-                    optimal_target=optimal_target,
+                    target_info=target_info,
                     runs=runs,
-                    cp_workers=args.cp_workers,
                     parallel_runs=args.parallel_runs,
                     inst_name=inst_name,
+                    run_config=run_config,
                 )
 
                 successful_runs = len(run_records)
@@ -904,11 +1165,12 @@ def main():
                     print(f"  [ERROR] Instance {inst_name} produced no successful runs")
                     continue
 
-                summary_row = build_summary_row(inst_name, bks_val, run_records, successful_runs)
+                summary_row = build_summary_row(inst_name, target_info, run_records, successful_runs)
                 summary_rows.append(summary_row)
                 print(
                     f"  [Result] {inst_name} summary | Best={summary_row['Hybrid_Best_Makespan']}"
                     f" | Avg={summary_row['Hybrid_Avg_Makespan']} | RPD={summary_row['RPD_%'] or 'n/a'}%"
+                    f" | CP-only={summary_row['CP_Only_TotalBudget_Avg_Makespan'] or 'n/a'}"
                     f" | Successful Runs={successful_runs}/{runs}"
                 )
                 
@@ -923,25 +1185,32 @@ def main():
 
         jobs, _, detected_format = parse_instance_file(args.instance, args.format)
         instance, _ = _jobs_to_instance(jobs)
-        cp_budget, tabu_budget = compute_time_budgets(instance)
+        cp_budget, tabu_budget, total_budget, budget_mode = resolve_time_budgets(
+            instance,
+            cp_budget_override=args.cp_budget,
+            tabu_budget_override=args.tabu_budget,
+            total_budget_override=args.total_budget,
+            cp_fraction=args.cp_fraction,
+        )
         inst_name = os.path.splitext(os.path.basename(args.instance))[0]
         target_map = load_instance_targets(os.path.dirname(args.instance) or ".", bks_csv=args.bks_csv, metadata_json=args.metadata_json)
         target_info = target_map.get(inst_name.lower(), {})
-        bks_val = target_info.get("reference")
-        optimal_target = target_info.get("optimal_target")
+        run_config = dict(shared_run_config)
+        run_config.update({"cp_budget": cp_budget, "tabu_budget": tabu_budget})
 
         print(f"\n  [Single Instance] {inst_name} ({detected_format})")
-        print(f"  [Budgets] CP={cp_budget:.1f}s | TS={tabu_budget:.1f}s | CP Workers={args.cp_workers}")
+        print(f"  [Targets] {format_target_summary(target_info)}")
+        print(
+            f"  [Budgets] Mode={budget_mode} | Total={total_budget:.2f}s"
+            f" | CP={cp_budget:.2f}s | TS={tabu_budget:.2f}s | CP Workers={normalize_cp_workers(args.cp_workers)}"
+        )
         run_record = run_single_experiment(
             instance,
-            cp_budget,
-            tabu_budget,
-            bks=bks_val,
-            optimal_target=optimal_target,
+            target_info=target_info,
             run_index=0,
-            cp_workers=args.cp_workers,
+            **run_config,
         )
-        summary_row = build_summary_row(inst_name, bks_val, [run_record], 1)
+        summary_row = build_summary_row(inst_name, target_info, [run_record], 1)
         write_benchmark_summary_csv(args.output_csv, [summary_row])
         print(f"  [CSV] Wrote summary to: {args.output_csv}")
         return
